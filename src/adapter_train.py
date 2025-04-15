@@ -14,6 +14,7 @@ import logging
 import transformers
 from dataset import mcDataset
 from dataset import haDataset
+from dataset import ScienceQADataset
 
 MyDataset = None
 DATASET_PATH = None
@@ -21,6 +22,7 @@ DATASET_NAME = None
 CANDIDATE_DATASETS = {
     "medmc":        [mcDataset,      "/d2/mxy/W-LoRA/data/Domains-Based/med/mc"],
     "finha":        [haDataset,      "/d2/mxy/W-LoRA/data/Domains-Based/fin/ha"],
+    "scienceqa":    [ScienceQADataset, "/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf"]
 }
 
 logging.basicConfig(level=logging.INFO)

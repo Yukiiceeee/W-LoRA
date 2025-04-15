@@ -9,6 +9,14 @@ PROMPT_DICT = {
         "Write a response that appropriately completes the request.\n\n"
         "### Instruction:\n{instruction}\n\n### Response:\n"
     ),
+    "prompt_mc_input_short": (
+        "Below is a multiple choice question. Write a response that contains the letter of the correct answer (e.g., 'B').\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+    ),
+    "prompt_mc_no_input_short": (
+        "Below is a multiple choice question. Write a response that contains the letter of the correct answer (e.g., 'B').\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:\n"
+    ),
     "prompt_mc_input": (
         "Below is a multiple choice question. Write a response that contains the letter of the correct answer followed by its complete content (e.g., 'B. Head is the right part').\n\n"
         "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
