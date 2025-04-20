@@ -2,6 +2,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType
 from typing import Dict, Optional, Sequence, List
+from datasets import load_from_disk
 from transformers import Trainer, TrainingArguments
 from torch.utils.data import Dataset
 from dataclasses import dataclass, field
@@ -27,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def run(args):
-    prompt_input, prompt_no_input = PROMPT_DICT["prompt_mc_input"], PROMPT_DICT["prompt_mc_no_input"]
+    prompt_input, prompt_no_input = PROMPT_DICT["prompt_mc_input_short"], PROMPT_DICT["prompt_mc_no_input_short"]
     model_path = args.model_path
     adapter_path = args.adapter_path
     data_path = args.data_path
@@ -37,10 +38,14 @@ def run(args):
     model = AutoModelForCausalLM.from_pretrained(model_path, device_map='auto', torch_dtype='auto', trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
 
-    # model = PeftModel.from_pretrained(model, adapter_path)
+    model = PeftModel.from_pretrained(model, adapter_path)
 
-    with open(data_path, "r") as f:
-        data = json.load(f)
+    if task_type == "scienceqa":
+        data = load_from_disk(data_path)
+        data = data["test"]
+    else:
+        with open(data_path, "r") as f:
+            data = json.load(f)
     
     logger.info(f"data length: {len(data)}")
 
@@ -55,9 +60,11 @@ def run(args):
             )
         full_text = tokenizer.decode(output[0], skip_special_tokens=True)
         out_text = full_text.removeprefix(input_prompt)
-        # logger.info(f"output: {example['output']}")
-        # logger.info(f"pred: {out_text}")
+        logger.info(f"output: {example['output']}")
+        logger.info(f"pred: {out_text}")
         example["pred"] = out_text
+
+        pattern = re.compile(r'The answer is ([A-Z]).')
 
         match metric:
             case "acc":
@@ -70,9 +77,13 @@ def run(args):
                         content = match.group(1).strip("'")
                         if content == example["pred"] or example["pred"].startswith(content) or content.startswith(example["pred"]):
                             acc += 1
-                else:
-                    if example["output"] in example["pred"]:
-                        acc += 1
+                elif task_type == "scienceqa":
+                    match = pattern.search(example["output"])
+                    if match:
+                        answer_choice = match.group(1)
+                        if answer_choice in example["pred"]:
+                            acc += 1
+
                 logger.info(f"acc: {acc / (index+1)}")
 
     acc_path = adapter_path + "/acc.json"
