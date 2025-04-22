@@ -35,6 +35,8 @@ class ModelArguments:
     lora_r: Optional[int] = field(default=8)
     lora_alpha: Optional[float] = field(default=16)
     lora_dropout: Optional[float] = field(default=0.05)
+    previous_lora_r: Optional[int] = field(default=8)
+    previous_lora_path: Optional[str] = field(default=None)
 
 @dataclass
 class DataArguments:
@@ -83,24 +85,6 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
         logger.warning("Using DeepSpeed")
 
     model = transformers.AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
-
-    config = LoraConfig(
-        r = model_args.lora_r,
-        lora_alpha = model_args.lora_alpha,
-        lora_dropout = model_args.lora_dropout,
-        inference_mode = False,
-        bias = "none",
-        task_type = "CAUSAL_LM",
-        target_modules=get_target_modules(model.config.model_type.lower(), model.named_modules()),
-    )
-
-    model = get_peft_model(model, config)
-    model.print_trainable_parameters()
-
-    if torch.cuda.device_count() > 1:
-        model.is_parallelizable = True
-        model.model_parallel = True
-
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         padding_side = "left",
@@ -109,6 +93,54 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
         model_max_length=training_args.model_max_length,
         use_fast=False,
     )
+    target_modules = get_target_modules(model.config.model_type.lower(), model.named_modules())
+
+    if model_args.previous_lora_path:
+        old_config = LoraConfig(
+            r = model_args.previous_lora_r,
+            lora_alpha = model_args.lora_alpha,
+            lora_dropout = model_args.lora_dropout,
+            inference_mode = False,
+            bias = "none",
+            task_type = "CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        model = get_peft_model(model, old_config)
+        model.load_adapter(model_args.previous_lora_path, adapter_name="old_adapter")
+        for name, param in model.named_parameters():
+            if "old_adapter" in name:
+                param.requires_grad = False
+        
+        new_r = model_args.lora_r - model_args.previous_lora_r
+        new_config = LoraConfig(
+            r = new_r,
+            lora_alpha = model_args.lora_alpha,
+            lora_dropout = model_args.lora_dropout,
+            inference_mode = False,
+            bias = "none",
+            task_type = "CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        model.add_adapter("new_adapter", new_config)
+        model.set_adapter("old_adapter")
+        model.set_adapter("new_adapter")
+    else:
+        config = LoraConfig(
+            r = model_args.lora_r,
+            lora_alpha = model_args.lora_alpha,
+            lora_dropout = model_args.lora_dropout,
+            inference_mode = False,
+            bias = "none",
+            task_type = "CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        model = get_peft_model(model, config)
+
+    model.print_trainable_parameters()
+
+    if torch.cuda.device_count() > 1:
+        model.is_parallelizable = True
+        model.model_parallel = True
 
     return model, tokenizer
 

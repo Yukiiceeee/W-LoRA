@@ -4,6 +4,7 @@ from peft import LoraConfig, get_peft_model, TaskType
 from typing import Dict, Optional, Sequence, List
 from transformers import Trainer, TrainingArguments
 from torch.utils.data import Dataset
+from safetensors.torch import load_file
 from dataclasses import dataclass, field
 from peft.utils import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING as LORA_TARGET_MAP
 import json
@@ -35,6 +36,11 @@ class ModelArguments:
     lora_r: Optional[int] = field(default=8)
     lora_alpha: Optional[float] = field(default=16)
     lora_dropout: Optional[float] = field(default=0.05)
+
+    incremental_lora: Optional[bool] = field(default=True)
+    base_lora_path: Optional[str] = field(default=None)
+    base_lora_r: Optional[int] = field(default=None)
+    freeze_base_lora: Optional[bool] = field(default=True)
 
 @dataclass
 class DataArguments:
@@ -95,7 +101,75 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
     )
 
     model = get_peft_model(model, config)
+    logger.info("Original trainable parameters:")
     model.print_trainable_parameters()
+
+    if model_args.incremental_lora and model_args.base_lora_path and model_args.base_lora_r:
+        logger.info(f"Loading base LoRA weights from {model_args.base_lora_path} with r={model_args.base_lora_r}")
+        base_model_path = os.path.join(model_args.base_lora_path, "adapter_model.safetensors")
+        base_model_state_dict = load_file(base_model_path)
+
+        # 获取所有LoRA模块的名称
+        lora_params = {}
+        for name, param in model.named_parameters():
+            if any(n in name for n in ['lora_A', 'lora_B']):
+                lora_params[name] = param
+
+        # 检查并打印基础模型的权重形状
+        logger.info("Base model weights shapes:")
+        for name in lora_params.keys():
+            if name in base_model_state_dict:
+                logger.info(f"{name}: {base_model_state_dict[name].shape}")
+
+        # 处理每个LoRA模块
+        for name, param in lora_params.items():
+            if name in base_model_state_dict:
+                base_weight = base_model_state_dict[name]
+                
+                # 检查是A矩阵还是B矩阵
+                if 'lora_A' in name:
+                    # 检查维度
+                    if base_weight.shape[0] != model_args.base_lora_r:
+                        logger.warning(f"Base weight shape mismatch for {name}: expected first dim {model_args.base_lora_r}, got {base_weight.shape[0]}")
+                        continue
+                        
+                    # 复制权重
+                    param.data[:model_args.base_lora_r, :] = base_weight
+                    
+                    # 设置梯度掩码
+                    if model_args.freeze_base_lora:
+                        grad_mask = torch.ones_like(param.data, dtype=torch.bool)
+                        grad_mask[:model_args.base_lora_r, :] = False
+                        param.register_hook(lambda grad, mask=grad_mask: grad * mask.to(grad.device))
+                
+                elif 'lora_B' in name:
+                    # 检查维度
+                    if base_weight.shape[1] != model_args.base_lora_r:
+                        logger.warning(f"Base weight shape mismatch for {name}: expected second dim {model_args.base_lora_r}, got {base_weight.shape[1]}")
+                        continue
+                        
+                    # 复制权重
+                    param.data[:, :model_args.base_lora_r] = base_weight
+                    
+                    # 设置梯度掩码
+                    if model_args.freeze_base_lora:
+                        grad_mask = torch.ones_like(param.data, dtype=torch.bool)
+                        grad_mask[:, :model_args.base_lora_r] = False
+                        param.register_hook(lambda grad, mask=grad_mask: grad * mask.to(grad.device))
+
+        # 打印可训练参数信息
+        logger.info("\nAfter loading base LoRA weights and setting up gradient masks:")
+        trainable_params = 0
+        all_param = 0
+        for name, param in model.named_parameters():
+            all_param += param.numel()
+            if param.requires_grad:
+                if any(n in name for n in ['lora_A', 'lora_B']):
+                    trainable_params += (param.numel() * (model_args.lora_r - model_args.base_lora_r) / model_args.lora_r)
+                else:
+                    trainable_params += param.numel()
+        
+        logger.info(f"trainable params: {int(trainable_params)} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.4f}")
 
     if torch.cuda.device_count() > 1:
         model.is_parallelizable = True
@@ -110,11 +184,21 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
         use_fast=False,
     )
 
-    return model, tokenizer
+    return model, tokenizer 
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
+    if model_args.incremental_lora:
+        if not model_args.base_lora_path:
+            raise ValueError("base_lora_path must be provided when incremental_lora=True")
+        if not model_args.base_lora_r:
+            raise ValueError("base_lora_r must be provided when incremental_lora=True")
+        if model_args.base_lora_r >= model_args.lora_r:
+            raise ValueError(f"base_lora_r ({model_args.base_lora_r}) must be less than lora_r ({model_args.lora_r})")
+        logger.info(f"Incremental LoRA training: loading r={model_args.base_lora_r} from {model_args.base_lora_path}, training to r={model_args.lora_r}")
+    
     global DATASET_NAME, MyDataset, DATASET_PATH
     DATASET_NAME = data_args.data_name
     MyDataset = CANDIDATE_DATASETS[DATASET_NAME][0]
