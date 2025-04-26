@@ -37,7 +37,7 @@ class ModelArguments:
     lora_alpha: Optional[float] = field(default=16)
     lora_dropout: Optional[float] = field(default=0.05)
 
-    incremental_lora: Optional[bool] = field(default=True)
+    incremental_lora: Optional[int] = field(default=1)
     base_lora_path: Optional[str] = field(default=None)
     base_lora_r: Optional[int] = field(default=None)
     freeze_base_lora: Optional[bool] = field(default=True)
@@ -78,7 +78,7 @@ def get_target_modules(model_type, named_modules):
     #     if "lm_head" in lora_module_names:
 
 def load_model_and_tokenizer(model_args: ModelArguments, training_args: TrainingArguments):
-    model_kwargs={
+    model_kwargs = {
         "cache_dir": training_args.cache_dir,
         "torch_dtype": 'auto',
         "trust_remote_code": True,
@@ -89,18 +89,30 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
         logger.warning("Using DeepSpeed")
 
     model = transformers.AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
-
-    config = LoraConfig(
-        r = model_args.lora_r,
-        lora_alpha = model_args.lora_alpha,
-        lora_dropout = model_args.lora_dropout,
-        inference_mode = False,
-        bias = "none",
-        task_type = "CAUSAL_LM",
-        target_modules=get_target_modules(model.config.model_type.lower(), model.named_modules()),
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        padding_side="left",
+        trust_remote_code=True,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        use_fast=False,
     )
 
+    # 获取目标模块列表
+    target_modules = get_target_modules(model.config.model_type.lower(), model.named_modules())
+
+    # 创建新LoRA配置（总秩r=10）
+    config = LoraConfig(
+        r=model_args.lora_r,
+        lora_alpha=model_args.lora_alpha,
+        lora_dropout=model_args.lora_dropout,
+        inference_mode=False,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=target_modules,
+    )
     model = get_peft_model(model, config)
+    
     logger.info("Original trainable parameters:")
     model.print_trainable_parameters()
 
@@ -109,87 +121,91 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
         base_model_path = os.path.join(model_args.base_lora_path, "adapter_model.safetensors")
         base_model_state_dict = load_file(base_model_path)
 
-        # 获取所有LoRA模块的名称
-        lora_params = {}
+        # 构建名称映射表
+        name_mapping = {}
+        for old_name in base_model_state_dict.keys():
+            # 移除可能存在的多余前缀
+            new_name = old_name.replace("base_model.model.", "")
+            new_name = new_name.replace(".default", "")
+            name_mapping[new_name] = old_name
+
+        # 参数处理
         for name, param in model.named_parameters():
-            if any(n in name for n in ['lora_A', 'lora_B']):
-                lora_params[name] = param
+            if 'lora_' in name:
+                # 转换参数名
+                simplified_name = name.replace("base_model.model.", "").replace(".default", "")
+                base_weight_name = name_mapping.get(simplified_name, None)
 
-        # 检查并打印基础模型的权重形状
-        logger.info("Base model weights shapes:")
-        for name in lora_params.keys():
-            if name in base_model_state_dict:
-                logger.info(f"{name}: {base_model_state_dict[name].shape}")
+                if not base_weight_name:
+                    logger.warning(f"Missing mapping for {name}")
+                    continue
 
-        # 处理每个LoRA模块
-        for name, param in lora_params.items():
-            if name in base_model_state_dict:
-                base_weight = base_model_state_dict[name]
-                
-                # 检查是A矩阵还是B矩阵
-                if 'lora_A' in name:
-                    # 检查维度
-                    if base_weight.shape[0] != model_args.base_lora_r:
-                        logger.warning(f"Base weight shape mismatch for {name}: expected first dim {model_args.base_lora_r}, got {base_weight.shape[0]}")
-                        continue
-                        
-                    # 复制权重
-                    param.data[:model_args.base_lora_r, :] = base_weight
+                if base_weight_name and base_weight_name in base_model_state_dict:
+                    base_weight = base_model_state_dict[base_weight_name]
                     
-                    # 设置梯度掩码
-                    if model_args.freeze_base_lora:
-                        grad_mask = torch.ones_like(param.data, dtype=torch.bool)
-                        grad_mask[:model_args.base_lora_r, :] = False
-                        param.register_hook(lambda grad, mask=grad_mask: grad * mask.to(grad.device))
-                
-                elif 'lora_B' in name:
-                    # 检查维度
-                    if base_weight.shape[1] != model_args.base_lora_r:
-                        logger.warning(f"Base weight shape mismatch for {name}: expected second dim {model_args.base_lora_r}, got {base_weight.shape[1]}")
+                    if base_weight is None:
+                        logger.warning(f"Missing base weight for {base_weight_name}")
                         continue
+
+                    # 处理A矩阵
+                    if 'lora_A' in name:
+                        # 维度校验
+                        if base_weight.shape[0] != model_args.base_lora_r:
+                            raise ValueError(f"A矩阵维度不匹配: {base_weight.shape} vs 预期r={model_args.base_lora_r}")
                         
-                    # 复制权重
-                    param.data[:, :model_args.base_lora_r] = base_weight
-                    
-                    # 设置梯度掩码
-                    if model_args.freeze_base_lora:
-                        grad_mask = torch.ones_like(param.data, dtype=torch.bool)
+                        # 加载权重并设置梯度
+                        param.data[:model_args.base_lora_r] = base_weight
+                        grad_mask = torch.ones_like(param, dtype=torch.bool)
+                        grad_mask[:model_args.base_lora_r] = False
+                        param.requires_grad = True
+                        param.register_hook(lambda grad: grad * grad_mask.to(grad.device))
+
+                    # 处理B矩阵
+                    elif 'lora_B' in name:
+                        if base_weight.shape[1] != model_args.base_lora_r:
+                            raise ValueError(f"B矩阵维度不匹配: {base_weight.shape} vs 预期r={model_args.base_lora_r}")
+                        
+                        param.data[:, :model_args.base_lora_r] = base_weight
+                        grad_mask = torch.ones_like(param, dtype=torch.bool)
                         grad_mask[:, :model_args.base_lora_r] = False
-                        param.register_hook(lambda grad, mask=grad_mask: grad * mask.to(grad.device))
+                        param.requires_grad = True
+                        param.register_hook(lambda grad: grad * grad_mask.to(grad.device))
 
-        # 打印可训练参数信息
-        logger.info("\nAfter loading base LoRA weights and setting up gradient masks:")
-        trainable_params = 0
-        all_param = 0
+        # 正确统计参数
+        logger.info("\nFinal trainable parameters:")
+        model.print_trainable_parameters()
+
+        model.train()
+        dummy_input = tokenizer("Test input for grad check", return_tensors="pt").to(model.device)
+        dummy_input["labels"] = dummy_input["input_ids"].clone()
+        outputs = model(**dummy_input)
+        loss = outputs.loss
+        # 反向传播
+        loss.backward()
+
+        # 验证冻结效果
+        total_params = 0
+        frozen_params = 0
         for name, param in model.named_parameters():
-            all_param += param.numel()
-            if param.requires_grad:
-                if any(n in name for n in ['lora_A', 'lora_B']):
-                    trainable_params += (param.numel() * (model_args.lora_r - model_args.base_lora_r) / model_args.lora_r)
-                else:
-                    trainable_params += param.numel()
-        
-        logger.info(f"trainable params: {int(trainable_params)} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.4f}")
+            if 'lora_' in name:
+                total_params += param.numel()
+                if param.grad is None:  # 未计算过梯度的参数
+                    frozen_params += param.numel()
+                else:  # 计算过梯度但被mask的参数
+                    frozen_params += (param.grad == 0).sum().item()
+        logger.info(f"实际冻结参数比例: {100*frozen_params/total_params:.2f}%")
 
     if torch.cuda.device_count() > 1:
         model.is_parallelizable = True
         model.model_parallel = True
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        padding_side = "left",
-        trust_remote_code=True,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        use_fast=False,
-    )
-
-    return model, tokenizer 
+    return model, tokenizer
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    
+    incremental_lora = model_args.incremental_lora
+
     if model_args.incremental_lora:
         if not model_args.base_lora_path:
             raise ValueError("base_lora_path must be provided when incremental_lora=True")
@@ -213,11 +229,11 @@ def train():
     train_dataset, test_dataset = MyDataset.load_dataset(
         data_path = DATASET_PATH,
         tokenizer = tokenizer,
-        max_length = training_args.model_max_length
+        max_length = training_args.model_max_length,
+        incremental_lora = incremental_lora
     )
     logger.warning(f"train_dataset numbers: {len(train_dataset)}")
     logger.warning(f"test_dataset numbers: {len(test_dataset)}")
-
 
     ### Training
     logger.warning("Creating trainer...")

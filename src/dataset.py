@@ -124,7 +124,7 @@ class MultipleChoiceQADataset(Dataset):
     }
 
     @classmethod
-    def load_dataset(cls, data_path, tokenizer, max_length):
+    def load_dataset(cls, data_path, tokenizer, max_length, incremental_lora):
         raise NotImplementedError
     
     def __init__(self, data, tokenizer, max_length, dataset_type):
@@ -205,19 +205,35 @@ class ScienceQADataset(MultipleChoiceQADataset):
     MAX_SAMPLE_INPUT_LENGTH = 256
     MAX_SAMPLE_OUTPUT_LENGTH = 10
     prompt_template = {
-        "prompt_input": "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
-        "prompt_no_input": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n",
+        "prompt_input": "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. The reply format is: “The answer is ([A-Z]).”\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
+        "prompt_no_input": "Below is an instruction that describes a task. Write a response that appropriately completes the request. The reply format is: “The answer is ([A-Z]).”\n\n### Instruction:\n{instruction}\n\n### Response:\n",
         "response_split": "### Response:",
         "response_template": r'The answer is ([A-Z]).',
         "failed_str": "FAILD"
     }
-    @classmethod
-    def load_dataset(cls, data_path, tokenizer, max_length):
+    def load_dataset(data_path, tokenizer, max_length, incremental_lora):
         data = load_from_disk(data_path)
-        train_dataset = ScienceQADataset(data = data["train"], tokenizer = tokenizer, max_length = max_length, dataset_type = "train")
-        val_dataset = ScienceQADataset(data = data["validation"], tokenizer = tokenizer, max_length = max_length, dataset_type = "validation")
+        train_data = data["train"]
+        # Calculate the split point for training data
+        train_size = len(train_data)
+        split_point = train_size // 2
+        
+        if incremental_lora == 1:
+            # Use first half of training data
+            train_subset = train_data.select(range(split_point))
+            train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+        elif incremental_lora == 2:
+            # Use second half of training data
+            train_subset = train_data.select(range(split_point, train_size))
+            train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+        elif incremental_lora == 0:
+            # Use all training data
+            train_dataset = ScienceQADataset(data=train_data, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+        
+        # Validation dataset remains unchanged
+        val_dataset = ScienceQADataset(data=data["validation"], tokenizer=tokenizer, max_length=max_length, dataset_type="validation")
+        
         return train_dataset, val_dataset
-
     
 def main():
     print("开始验证多选题数据集...")

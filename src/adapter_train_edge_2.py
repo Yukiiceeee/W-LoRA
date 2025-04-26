@@ -35,8 +35,9 @@ class ModelArguments:
     lora_r: Optional[int] = field(default=8)
     lora_alpha: Optional[float] = field(default=16)
     lora_dropout: Optional[float] = field(default=0.05)
-    previous_lora_r: Optional[int] = field(default=8)
-    previous_lora_path: Optional[str] = field(default=None)
+    incremental_lora:Optional[int] = field(default=1)
+    base_lora_r: Optional[int] = field(default=8)
+    base_lora_path: Optional[str] = field(default=None)
 
 @dataclass
 class DataArguments:
@@ -95,9 +96,9 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
     )
     target_modules = get_target_modules(model.config.model_type.lower(), model.named_modules())
 
-    if model_args.previous_lora_path:
+    if model_args.incremental_lora == 2:
         old_config = LoraConfig(
-            r = model_args.previous_lora_r,
+            r = model_args.base_lora_r,
             lora_alpha = model_args.lora_alpha,
             lora_dropout = model_args.lora_dropout,
             inference_mode = False,
@@ -106,12 +107,12 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
             target_modules=target_modules,
         )
         model = get_peft_model(model, old_config)
-        model.load_adapter(model_args.previous_lora_path, adapter_name="old_adapter")
+        model.load_adapter(model_args.base_lora_path, adapter_name="old_adapter")
         for name, param in model.named_parameters():
             if "old_adapter" in name:
                 param.requires_grad = False
         
-        new_r = model_args.lora_r - model_args.previous_lora_r
+        new_r = model_args.lora_r - model_args.base_lora_r
         new_config = LoraConfig(
             r = new_r,
             lora_alpha = model_args.lora_alpha,
@@ -124,7 +125,7 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
         model.add_adapter("new_adapter", new_config)
         model.set_adapter("old_adapter")
         model.set_adapter("new_adapter")
-    else:
+    elif model_args.incremental_lora == 1 or model_args.incremental_lora == 0:
         config = LoraConfig(
             r = model_args.lora_r,
             lora_alpha = model_args.lora_alpha,
@@ -147,6 +148,7 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    incremental_lora = model_args.incremental_lora
     global DATASET_NAME, MyDataset, DATASET_PATH
     DATASET_NAME = data_args.data_name
     MyDataset = CANDIDATE_DATASETS[DATASET_NAME][0]
@@ -161,7 +163,8 @@ def train():
     train_dataset, test_dataset = MyDataset.load_dataset(
         data_path = DATASET_PATH,
         tokenizer = tokenizer,
-        max_length = training_args.model_max_length
+        max_length = training_args.model_max_length,
+        incremental_lora = incremental_lora
     )
     logger.warning(f"train_dataset numbers: {len(train_dataset)}")
     logger.warning(f"test_dataset numbers: {len(test_dataset)}")

@@ -43,6 +43,8 @@ def run(args):
     if task_type == "scienceqa":
         data = load_from_disk(data_path)
         data = data["test"]
+        # Convert Dataset to list of dictionaries
+        data = [dict(item) for item in data]
     else:
         with open(data_path, "r") as f:
             data = json.load(f)
