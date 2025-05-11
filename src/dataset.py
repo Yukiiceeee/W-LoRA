@@ -214,23 +214,18 @@ class ScienceQADataset(MultipleChoiceQADataset):
     def load_dataset(data_path, tokenizer, max_length, incremental_lora):
         data = load_from_disk(data_path)
         train_data = data["train"]
-        # Calculate the split point for training data
         train_size = len(train_data)
         split_point = train_size // 2
         
-        if incremental_lora == 1:
-            # Use first half of training data
+        if incremental_lora == "domain":
             train_subset = train_data.select(range(split_point))
             train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
-        elif incremental_lora == 2:
-            # Use second half of training data
+        elif incremental_lora == "task":
             train_subset = train_data.select(range(split_point, train_size))
             train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
-        elif incremental_lora == 0:
-            # Use all training data
+        elif incremental_lora == "all":
             train_dataset = ScienceQADataset(data=train_data, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
         
-        # Validation dataset remains unchanged
         val_dataset = ScienceQADataset(data=data["validation"], tokenizer=tokenizer, max_length=max_length, dataset_type="validation")
         
         return train_dataset, val_dataset

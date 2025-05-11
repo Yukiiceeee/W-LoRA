@@ -1,6 +1,6 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel, PeftMixedModel
 from typing import Dict, Optional, Sequence, List
 from transformers import Trainer, TrainingArguments
 from torch.utils.data import Dataset
@@ -12,6 +12,7 @@ import os
 import copy
 import logging
 import transformers
+from safetensors import safe_open
 from dataset import mcDataset
 from dataset import haDataset
 from dataset import ScienceQADataset
@@ -32,10 +33,10 @@ logger = logging.getLogger(__name__)
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="/d2/mxy/Models/Qwen2-7B")
     peft_type: Optional[str] = field(default="lora")
-    lora_r: Optional[int] = field(default=8)
+    lora_r: Optional[int] = field(default=10)
     lora_alpha: Optional[float] = field(default=16)
     lora_dropout: Optional[float] = field(default=0.05)
-    incremental_lora:Optional[int] = field(default=1)
+    incremental_lora:Optional[str] = field(default="domain")
     base_lora_r: Optional[int] = field(default=8)
     base_lora_path: Optional[str] = field(default=None)
 
@@ -96,7 +97,7 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
     )
     target_modules = get_target_modules(model.config.model_type.lower(), model.named_modules())
 
-    if model_args.incremental_lora == 2:
+    if model_args.incremental_lora == "task":
         old_config = LoraConfig(
             r = model_args.base_lora_r,
             lora_alpha = model_args.lora_alpha,
@@ -106,11 +107,18 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
             task_type = "CAUSAL_LM",
             target_modules=target_modules,
         )
-        model = get_peft_model(model, old_config)
-        model.load_adapter(model_args.base_lora_path, adapter_name="old_adapter")
-        for name, param in model.named_parameters():
-            if "old_adapter" in name:
-                param.requires_grad = False
+        # model = get_peft_model(model, old_config, adapter_name="base_adapter")
+        # model = PeftModel(model, old_config, adapter_name="base_adapter")
+        model = PeftMixedModel(model, old_config, adapter_name="base_adapter")
+        
+        # if model_args.base_lora_path:
+        #     model.load_adapter(model_args.base_lora_path, adapter_name="base_adapter")
+        adapter_weights_path = f"{model_args.base_lora_path}/adapter_model.safetensors"
+        adapter_state_dict = {}
+        with safe_open(adapter_weights_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                adapter_state_dict[key] = f.get_tensor(key)
+        missing_keys, unexpected_keys = model.load_state_dict(adapter_state_dict, strict=False)
         
         new_r = model_args.lora_r - model_args.base_lora_r
         new_config = LoraConfig(
@@ -122,10 +130,15 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
             task_type = "CAUSAL_LM",
             target_modules=target_modules,
         )
-        model.add_adapter("new_adapter", new_config)
-        model.set_adapter("old_adapter")
-        model.set_adapter("new_adapter")
-    elif model_args.incremental_lora == 1 or model_args.incremental_lora == 0:
+        
+        model.add_adapter("incremental_adapter", new_config)
+        model.set_adapter(["base_adapter", "incremental_adapter"])
+        for name, param in model.named_parameters():
+            if "base_adapter" in name:
+                param.requires_grad = False
+        logger.info(f"Active adapters: {model.active_adapters}")
+        
+    elif model_args.incremental_lora == "domain" or model_args.incremental_lora == "all":
         config = LoraConfig(
             r = model_args.lora_r,
             lora_alpha = model_args.lora_alpha,
@@ -136,8 +149,7 @@ def load_model_and_tokenizer(model_args: ModelArguments, training_args: Training
             target_modules=target_modules,
         )
         model = get_peft_model(model, config)
-
-    model.print_trainable_parameters()
+        model.print_trainable_parameters()
 
     if torch.cuda.device_count() > 1:
         model.is_parallelizable = True

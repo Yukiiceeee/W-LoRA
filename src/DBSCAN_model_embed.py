@@ -1,186 +1,194 @@
+import torch
+from transformers import AutoTokenizer, AutoModel
 import numpy as np
 import faiss
-import torch
 import os
-from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import json
-from constants import PROMPT_DICT
-from sklearn.cluster import DBSCAN
-import fire
-import datasets
-from datasets import Dataset
-import umap.umap_ as umap
-from sklearn.preprocessing import StandardScaler
-from tqdm.auto import tqdm
-import sys
+from layers import separate_embedding_layer, load_embedding_layer
 from datasets import load_from_disk
 import logging
+import json
 import argparse
-from collections import Counter
 from constants import PROMPT_DICT
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from tqdm import tqdm
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('sentence_transformers')
+logger.setLevel(logging.WARNING)
 
-def load_model_and_tokenizer(modelpath: str):
-    model = AutoModelForCausalLM.from_pretrained(
-        modelpath,
-        trust_remote_code=True,
-        device_map="auto"
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        modelpath, 
-        trust_remote_code=True
-    )
+def load_model_and_tokenizer(modelpath: str, embeddingpath: str, ):
+    model = load_embedding_layer(embeddingpath)
+    tokenizer = AutoTokenizer.from_pretrained(modelpath, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
+    
     return model, tokenizer
-
-def get_embeddings(texts, args):
-    model_path = args.model_path
-    model, tokenizer = load_model_and_tokenizer(model_path)
-    model = model.to('cuda:0')
-    model.eval()
-
-    model.config.output_hidden_states = True
     
-    output_averages = []
-    batch_size = args.batch_size
-    with torch.no_grad():
-        for i in tqdm(range(0, len(texts), batch_size)):
-            batch_texts = texts[i:i+batch_size]
-            inputs = tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                padding_side="left",
-                max_length=args.max_length,
-                return_tensors="pt"
-            ).to('cuda:0')
-            outputs = model(**inputs, output_hidden_states=True)
-            if outputs.hidden_states is None:
-                raise ValueError("Model did not output hidden states. Please check model configuration.")
-            last_hidden_states = outputs.hidden_states[-1]
-            masks = inputs["attention_mask"].unsqueeze(-1)
-            masked_states = last_hidden_states * masks
-            sum_states = masked_states.sum(dim=1)
-            counts = masks.sum(dim=1)
-            counts = torch.clamp(counts, min=1e-9)
-            avg_states = (sum_states / counts).cpu().numpy()
-            output_averages.extend(avg_states)
-    
-    del model
-    torch.cuda.empty_cache()
-
-    output_array = np.stack(output_averages, axis=0)
-    logger.info(f"输出数组形状: {output_array.shape}")
-    logger.info(f"输出数组前5行: {output_array[:5]}")
-    return output_array
-
-def reduce_dim(embeddings, args):
-    logger.info(f"原始嵌入形状: {embeddings.shape}")
-    # scaler = StandardScaler()
-    # scaled_embeddings = scaler.fit_transform(embeddings)
-    scaled_embeddings = embeddings
-
-    reducer = umap.UMAP(
-        n_components=args.n_components,
-        n_neighbors=args.n_neighbors,
-        min_dist=args.min_dist,
-        random_state=42,
-        metric=args.metric
-    )
-
-    logger.info("使用UMAP进行降维...")
-    reduced_embeddings = reducer.fit_transform(scaled_embeddings)
-    logger.info(f"降维后维度: {reduced_embeddings.shape}")
-    logger.info(f"降维后前5行: {reduced_embeddings[:5]}")
-
-    return reduced_embeddings
-
-def dbscan(embeddings, args):
-    eps = args.eps
-    min_samples = args.min_samples
-    metric = args.metric
-    
-    # norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    # normalized_embeddings = embeddings / norms
-    normalized_embeddings = embeddings
-
-    db = DBSCAN(
-        eps=eps,
-        min_samples=min_samples,
-        metric=metric,
-        n_jobs=-1
-    )
-    cluster_labels = db.fit_predict(normalized_embeddings)
-
-    label_counts = Counter(cluster_labels)
-
-    largest_cluster = max(label_counts.items(), key=lambda x: x[1])[0]
-    
-    return cluster_labels, largest_cluster
-
-def process(args):
-    dataset = load_from_disk(args.data_path)
-    train_dataset = dataset["train"]
-    val_dataset = dataset["validation"]
-
-    train_dataset = train_dataset.select(range(1000))
-
-    logger.info(f"训练集样本数量: {len(train_dataset)}")
-    logger.info(f"验证集样本数量: {len(val_dataset)}")
-
-    texts = []
-    for item in train_dataset:
-        prompt = PROMPT_DICT["prompt_mc_input_short"].format(
-            instruction = item["instruction"],
-            input = item["input"] if item["input"] != "" else ""
+def format_text(item, prompt_input, prompt_no_input):
+    if item.get("input"):
+        return prompt_input.format(
+            instruction=item["instruction"],
+            input=item["input"]
         )
-        texts.append(prompt)
+    else:
+        return prompt_no_input.format(
+            instruction=item["instruction"]
+        )
     
-    logger.info("获取训练集embedding...")
-    embeddings = get_embeddings(texts, args)
-    logger.info("进行降维处理...")
-    reduced_embeddings = reduce_dim(embeddings, args)
-    logger.info("进行DBSCAN聚类...")
-    cluster_labels, largest_cluster = dbscan(reduced_embeddings, args)
-
-    largest_cluster_indices = [int(i) for i in np.where(cluster_labels == largest_cluster)[0]]
-    other_indices = [int(i) for i in np.where(cluster_labels != largest_cluster)[0]]
-
-    logger.info(f"簇的数量：{len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)}")
-    logger.info(f"最大簇的样本数量: {len(largest_cluster_indices)}")
-    logger.info(f"其他簇的样本数量: {len(other_indices)}")
-
-    largest_cluster_data = [train_dataset[i] for i in largest_cluster_indices]
-    other_cluster_data = [train_dataset[i] for i in other_indices]
+def get_embeddings(texts, model_id, embedding_id):
+    model, tokenizer = load_model_and_tokenizer(model_id, embedding_id)
     
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    largest_cluster_dataset = Dataset.from_list(largest_cluster_data)
-    other_cluster_dataset = Dataset.from_list(other_cluster_data)
-
-    # largest_cluster_dataset.save_to_disk(os.path.join(output_dir, "largest_cluster"))
-    # other_cluster_dataset.save_to_disk(os.path.join(output_dir, "other_clusters"))
+    model.eval()
     
-def main():
+    # inputs = [tokenizer(text, return_tensors="pt", padding=True, truncation=True).to('cuda') for text in texts]
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to('cuda:0')
+    inputs_ids = inputs['input_ids']
+
+    output_averages = []
+
+    with torch.no_grad():
+        from tqdm import tqdm
+        for i in tqdm(inputs_ids):
+            output = model(i)
+            output_average = torch.mean(output, dim=0)
+            output_averages.append(output_average.cpu().numpy())
+    output_averages = np.array(output_averages).squeeze()
+
+    del model
+    
+    return output_averages
+
+def cluster_embeddings_with_dbscan(embeddings, eps, min_samples, metric='L2'):
+    logger.warning("Starting DBSCAN clustering...")
+    logger.warning(f"Input embeddings shape: {embeddings.shape}")
+    
+    if np.isnan(embeddings).any() or np.isinf(embeddings).any():
+        logger.warning("Warning: embeddings contain NaN or inf values!")
+        embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=1e20, neginf=-1e20)
+    
+    scaler = StandardScaler()
+    try:
+        embeddings_scaled = scaler.fit_transform(embeddings)
+        logger.warning(f"Scaled embeddings shape: {embeddings_scaled.shape}")
+        logger.warning(f"Scaled embeddings mean: {np.mean(embeddings_scaled):.4f}, std: {np.std(embeddings_scaled):.4f}")
+    except Exception as e:
+        logger.warning(f"Standardization failed: {str(e)}")
+        return np.array([])
+    
+    if metric == "COS":
+        norms = np.linalg.norm(embeddings_scaled, axis=1, keepdims=True)
+        embeddings_scaled = embeddings_scaled / norms
+        metric = "euclidean"
+        logger.warning("Using normalized embeddings for cosine similarity")
+    else:
+        metric = "euclidean"
+    
+    try:
+        dbscan = DBSCAN(
+            eps=eps,
+            min_samples=min_samples,
+            metric=metric,
+            n_jobs=-1
+        )
+        logger.warning(f"Starting DBSCAN with eps={eps}, min_samples={min_samples}, metric={metric}")
+        cluster_labels = dbscan.fit_predict(embeddings_scaled)
+        logger.warning(f"DBSCAN completed. Labels shape: {cluster_labels.shape}")
+        
+        n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+        n_noise = list(cluster_labels).count(-1)
+        logger.warning(f"Number of clusters: {n_clusters}")
+        logger.warning(f"Number of noise points: {n_noise}")
+        
+        unique_labels = np.unique(cluster_labels)
+        cluster_centers_idx = []
+        
+        for label in unique_labels:
+            if label != -1:
+                cluster_points = embeddings_scaled[cluster_labels == label]
+                cluster_points_idx = np.where(cluster_labels == label)[0]
+                
+                if len(cluster_points) > 0:
+                    center = np.mean(cluster_points, axis=0)
+                    distances = np.linalg.norm(cluster_points - center, axis=1)
+                    center_idx = cluster_points_idx[np.argmin(distances)]
+                    cluster_centers_idx.append(center_idx)
+                    logger.warning(f"Cluster {label}: size={len(cluster_points)}, center_idx={center_idx}")
+        
+        logger.warning(f"DBSCAN finished: found {len(cluster_centers_idx)} clusters")
+        return np.array(cluster_centers_idx)
+        
+    except Exception as e:
+        logger.warning(f"DBSCAN clustering failed: {str(e)}")
+        return np.array([])
+
+def selector_data_embedding(
+    data_path: str,
+    model_path: str,
+    embedding_path: str,
+    eps: float,
+    min_samples: int,
+    domain: str,
+    task: str,
+    metric: str = 'L2'
+):
+    if data_path.endswith('.hf'):
+        data = load_from_disk(data_path)
+        if isinstance(data, dict):
+            data = data["train"]
+    else:
+        with open(data_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+    prompt_input = PROMPT_DICT["prompt_input"]
+    prompt_no_input = PROMPT_DICT["prompt_no_input"]
+    
+    texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
+
+    embeddings = get_embeddings(texts=texts, model_id=model_path, embedding_id=embedding_path)
+    labels = cluster_embeddings_with_dbscan(embeddings, eps, min_samples, metric)
+    
+    return [
+        {**item, "domain": domain, "task": task}
+        for idx, item in enumerate(data)
+        if idx in labels
+    ]
+
+if "__main__" == __name__:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="/d2/mxy/Models/Qwen2-7B")
-    parser.add_argument("--data_path", type=str, default="/d2/mxy/W-LoRA/data/Domains-Based/fin/ha/test.json")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--max_length", type=int, default=256)
-    parser.add_argument("--eps", type=float, default=100)
-    parser.add_argument("--min_samples", type=int, default=10)
-    parser.add_argument("--metric", type=str, default="euclidean")
-    parser.add_argument("--output_dir", type=str, default="/d2/mxy/W-LoRA/data/ScienceQA/DBSCAN_clustered")
-    parser.add_argument("--n_components", type=int, default=100, help="降维后的维度")
-    parser.add_argument("--n_neighbors", type=int, default=15, help="UMAP邻居数量")
-    parser.add_argument("--min_dist", type=float, default=0.1, help="UMAP最小距离")
+    parser.add_argument("--model_name", type=str, default="/d2/mxy/Models/Qwen2-7B")
+    parser.add_argument("--embedding_path", type=str, default="/d2/mxy/Models/Qwen2-7B/embedding.pth")
+    parser.add_argument("--eps", type=float, default=0.3, help="DBSCAN的邻域半径参数")
+    parser.add_argument("--min_samples", type=int, default=3, help="DBSCAN的最小样本数参数")
+    parser.add_argument("--data_path", type=str, default="/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf")
+    parser.add_argument("--metric", type=str, default="COS", choices=['L2', 'COS'], help="距离度量方式")
     args = parser.parse_args()
-    
-    process(args)
 
-if __name__ == "__main__":
-    main()
+    if args.data_path.endswith('.hf'):
+        data = load_from_disk(args.data_path)
+        if "train" in data:
+            data = data["train"]
+    else:
+        with open(args.data_path, 'r') as f:
+            data = json.load(f)
+
+    prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+    texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
+
+    embeddings = get_embeddings(texts=texts, model_id=args.model_name, embedding_id=args.embedding_path)
+    labels = cluster_embeddings_with_dbscan(embeddings, args.eps, args.min_samples, args.metric)
+
+    print(f"\nFound {len(labels)} clusters")
+    print("\nCluster center indices:", labels)
+    
+    label_list = [0] * len(embeddings)
+    for index in range(len(label_list)):
+        if index in labels:
+            label_list[index] = 1
+    
+    print(f"\nNumber of selected samples: {sum(label_list)}")
+    
+    print("\nSelected samples examples:")
+    for i in labels[:5]:
+        print(f"\nSample {i}:")
+        print(texts[i])

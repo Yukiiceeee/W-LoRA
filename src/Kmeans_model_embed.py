@@ -4,25 +4,33 @@ import numpy as np
 import faiss
 import os
 from layers import separate_embedding_layer, load_embedding_layer
-from datasets import load_dataset_from_disk
+from datasets import load_from_disk
 import logging
 import json
 import argparse
 from constants import PROMPT_DICT
 
 logger = logging.getLogger('sentence_transformers')
-
 logger.setLevel(logging.WARNING)
 
 def load_model_and_tokenizer(modelpath: str, embeddingpath: str, ):
-
     model = load_embedding_layer(embeddingpath)
     tokenizer = AutoTokenizer.from_pretrained(modelpath, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     
     return model, tokenizer
     
-
+def format_text(item, prompt_input, prompt_no_input):
+    if item.get("input"):
+        return prompt_input.format(
+            instruction=item["instruction"],
+            input=item["input"]
+        )
+    else:
+        return prompt_no_input.format(
+            instruction=item["instruction"]
+        )
+    
 def get_embeddings(texts, model_id, embedding_id):
     model, tokenizer = load_model_and_tokenizer(model_id, embedding_id)
     
@@ -46,20 +54,20 @@ def get_embeddings(texts, model_id, embedding_id):
     
     return output_averages
 
-def cluster_embeddings_with_faiss(embeddings, n_clusters, distance):
+def cluster_embeddings_with_faiss(embeddings, n_clusters, metric):
     logging.info("Kmeans...")
     # 转换为FAISS的float32格式
     embeddings_faiss = embeddings.astype(np.float32)
     # embeddings_faiss = embeddings
     # 创建FAISS索引
-    d = embeddings_faiss.shape[1]  # 数据维度
-    if distance == "L2":
+    d = embeddings_faiss.shape[1]
+    if metric == "L2":
         logger.warning("Using L2 distance")
         index = faiss.IndexFlatL2(d)
-    elif distance == "IP":
+    elif metric == "IP":
         logger.warning("Using IP distance")
         index = faiss.IndexFlatIP(d)
-    elif distance == "COS":
+    elif metric == "COS":
         # Normalization plus inner product equals cosine similarity
         norms = np.linalg.norm(embeddings_faiss, axis=1, keepdims=True)
         embeddings_faiss = embeddings_faiss / norms   
@@ -76,9 +84,10 @@ def cluster_embeddings_with_faiss(embeddings, n_clusters, distance):
     # kmeans = faiss.Kmeans(d, n_clusters, niter=50, verbose=True)
     kmeans = faiss.Kmeans(d, n_clusters, verbose=True)
     kmeans.train(embeddings_faiss)
-    # 如下是返回每个点的标签
+
+    # 如下是返回每个数据样本属于哪个簇
     # _, labels = kmeans.index.search(embeddings_faiss, 1)
-    # 如下是返回对应每个中心的索引
+    # 如下是返回对应离每个质心最近的数据样本的索引序号
     _, labels = index.search(kmeans.centroids, 1)
     
     logger.warning(f"Kmeans finished:{len(labels.flatten())}")
@@ -92,16 +101,24 @@ def selector_data_embedding(
     n_clusters: int,
     domain: str,
     task: str,
-    distance: str
+    metric: str
 ):
-    with open(data_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    if data_path.endswith('.hf'):
+        data = load_from_disk(data_path)
+        if isinstance(data, dict):
+            data = data["train"]
+    else:
+        with open(data_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
     prompt_input = PROMPT_DICT["prompt_input"]
-    texts = [prompt_input.format_map(i) for i in data]
+    prompt_no_input = PROMPT_DICT["prompt_no_input"]
+    
+    texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
 
     embeddings = get_embeddings(texts=texts, model_id=model_path, embedding_id=embedding_path)
-    labels = cluster_embeddings_with_faiss(embeddings, n_clusters, distance)
+    labels = cluster_embeddings_with_faiss(embeddings, n_clusters, metric)
+    
     return [
         {**item, "domain": domain, "task": task}
         for idx, item in enumerate(data)
@@ -115,27 +132,22 @@ if "__main__" == __name__:
     parser.add_argument("--n_clusters", type=int, default=100)
     parser.add_argument("--data_path", type=str, default="/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf")
     parser.add_argument("--task_type", type=str, default="qa")
+    parser.add_argument("--metric", type=str, default="L2")
     args = parser.parse_args()
 
-    model_name = args.model_name
-    embedding_path = args.embedding_path
-    n_clusters = args.n_clusters
-    data_path = args.data_path
-    task_type = args.task_type
-
-    if task_type == "qa":
-        data = load_dataset_from_disk(data_path)
-        train_data = data["train"]
-        test_data = data["test"]
-    else:
-        with open(data_path, 'r') as f:
+    if args.data_path.endswith('.hf'):  # HuggingFace dataset
+        data = load_from_disk(args.data_path)
+        if "train" in data:
+            data = data["train"]
+    else:  # JSON file
+        with open(args.data_path, 'r') as f:
             data = json.load(f)
 
     prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-    texts = [prompt_input.format_map(i) for i in data]
+    texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
 
-    embeddings = get_embeddings(texts=texts, model_id=model_name, embedding_id=embedding_path)
-    labels = cluster_embeddings_with_faiss(embeddings, n_clusters, 'L2')
+    embeddings = get_embeddings(texts=texts, model_id=args.model_name, embedding_id=args.embedding_path)
+    labels = cluster_embeddings_with_faiss(embeddings, args.n_clusters, args.metric)
 
     for i in labels:
         print(f"聚类标签: {i}")
