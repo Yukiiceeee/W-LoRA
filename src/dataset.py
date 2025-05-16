@@ -211,20 +211,43 @@ class ScienceQADataset(MultipleChoiceQADataset):
         "response_template": r'The answer is ([A-Z]).',
         "failed_str": "FAILD"
     }
-    def load_dataset(data_path, tokenizer, max_length, incremental_lora):
+    @classmethod
+    def load_dataset(cls, data_path, tokenizer, max_length, incremental_lora, cluster_results_path=None):
         data = load_from_disk(data_path)
         train_data = data["train"]
-        train_size = len(train_data)
-        split_point = train_size // 2
         
-        if incremental_lora == "domain":
-            train_subset = train_data.select(range(split_point))
+        if cluster_results_path and os.path.exists(cluster_results_path):
+            with open(cluster_results_path, 'r', encoding='utf-8') as f:
+                cluster_results = json.load(f)
+            
+            cluster_results = {int(k): v for k, v in cluster_results.items()}
+            
+            selected_indices = []
+            
+            if incremental_lora == "domain":
+                selected_indices = [idx for idx, info in cluster_results.items() if info["rank_percentage"] < 0.5]
+            elif incremental_lora == "task":
+                selected_indices = [idx for idx, info in cluster_results.items() if info["rank_percentage"] >= 0.5]
+            elif incremental_lora == "all":
+                selected_indices = list(cluster_results.keys())
+            
+            train_subset = train_data.select(selected_indices)
+            print(f"使用聚类结果选择了 {len(selected_indices)} 个样本")
             train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
-        elif incremental_lora == "task":
-            train_subset = train_data.select(range(split_point, train_size))
-            train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
-        elif incremental_lora == "all":
-            train_dataset = ScienceQADataset(data=train_data, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+        else:
+            train_size = len(train_data)
+            split_point = train_size // 2
+            
+            if incremental_lora == "domain":
+                train_subset = train_data.select(range(split_point))
+                train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+            elif incremental_lora == "task":
+                train_subset = train_data.select(range(split_point, train_size))
+                train_dataset = ScienceQADataset(data=train_subset, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+            elif incremental_lora == "all":
+                train_dataset = ScienceQADataset(data=train_data, tokenizer=tokenizer, max_length=max_length, dataset_type="train")
+            
+            print(f"没有使用聚类结果，按照原来的逻辑选择了 {len(train_dataset)} 个样本")
         
         val_dataset = ScienceQADataset(data=data["validation"], tokenizer=tokenizer, max_length=max_length, dataset_type="validation")
         
@@ -239,7 +262,9 @@ def main():
     train_dataset, test_dataset = ScienceQADataset.load_dataset(
         data_path="/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf",
         tokenizer=tokenizer,
-        max_length=256
+        max_length=256,
+        incremental_lora="task",
+        cluster_results_path="/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf/kmeans_cluster_results.json"
     )
 
     print(f"训练集大小: {len(train_dataset)}")

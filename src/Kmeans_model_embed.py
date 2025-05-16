@@ -80,19 +80,22 @@ def cluster_embeddings_with_faiss(embeddings, n_clusters, metric):
     index.add(embeddings_faiss)
 
     # 进行K-means聚类
-    # niter：迭代次数，verbose：log全部输出
-    # kmeans = faiss.Kmeans(d, n_clusters, niter=50, verbose=True)
     kmeans = faiss.Kmeans(d, n_clusters, verbose=True)
     kmeans.train(embeddings_faiss)
 
-    # 如下是返回每个数据样本属于哪个簇
-    # _, labels = kmeans.index.search(embeddings_faiss, 1)
-    # 如下是返回对应离每个质心最近的数据样本的索引序号
-    _, labels = index.search(kmeans.centroids, 1)
+    # 为每个样本分配聚类标签和获取到质心的距离
+    distances, labels = kmeans.index.search(embeddings_faiss, 1)
     
     logger.warning(f"Kmeans finished:{len(labels.flatten())}")
+    
+    # 如果使用的是内积相似度（IP或COS），将距离转换为相似度
+    if metric in ["IP", "COS"]:
+        # 内积距离越大表示越相似，我们用1减去归一化后的距离得到相似度
+        max_dist = np.max(distances)
+        min_dist = np.min(distances)
+        distances = 1 - (distances - min_dist) / (max_dist - min_dist)
 
-    return labels.flatten()
+    return labels.flatten(), distances.flatten()
 
 def selector_data_embedding(
     data_path: str,
@@ -117,11 +120,12 @@ def selector_data_embedding(
     texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
 
     embeddings = get_embeddings(texts=texts, model_id=model_path, embedding_id=embedding_path)
-    labels = cluster_embeddings_with_faiss(embeddings, n_clusters, metric)
+    labels, distances = cluster_embeddings_with_faiss(embeddings, n_clusters, metric)
     
+    # 返回带有聚类信息的数据
     return [
-        {**item, "domain": domain, "task": task}
-        for idx, item in enumerate(data)
+        {**item, "domain": domain, "task": task, "cluster_distance": float(dist)}
+        for idx, (item, dist) in enumerate(zip(data, distances))
         if idx in labels
     ]
 
@@ -129,7 +133,7 @@ if "__main__" == __name__:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="/d2/mxy/Models/Qwen2-7B")
     parser.add_argument("--embedding_path", type=str, default="/d2/mxy/Models/Qwen2-7B/embedding.pth")
-    parser.add_argument("--n_clusters", type=int, default=100)
+    parser.add_argument("--n_clusters", type=int, default=10)
     parser.add_argument("--data_path", type=str, default="/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf")
     parser.add_argument("--task_type", type=str, default="qa")
     parser.add_argument("--metric", type=str, default="L2")
@@ -147,16 +151,27 @@ if "__main__" == __name__:
     texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
 
     embeddings = get_embeddings(texts=texts, model_id=args.model_name, embedding_id=args.embedding_path)
-    labels = cluster_embeddings_with_faiss(embeddings, args.n_clusters, args.metric)
+    labels, distances = cluster_embeddings_with_faiss(embeddings, args.n_clusters, args.metric)
 
-    for i in labels:
-        print(f"聚类标签: {i}")
-    label_list = [0] * len(embeddings)
-    for index, label in enumerate(label_list):
-        if index in labels:
-            label_list[index] = 1
-    print(sum(label_list))
-    # for i in labels:
-    #     print(f"聚类中心: {texts[i]}")
-    # for i, text in enumerate(texts):
-    #     print(f"文本: {texts}, 聚类标签: {labels[i]}")
+    # 打印每个簇的样本数量和平均距离
+    unique_labels = np.unique(labels)
+    for label in unique_labels:
+        mask = labels == label
+        cluster_size = np.sum(mask)
+        avg_distance = np.mean(distances[mask])
+        print(f"簇 {label}: {cluster_size} 个样本, 平均距离: {avg_distance:.4f}")
+    
+    # 找出每个簇中距离质心最近和最远的样本
+    for label in unique_labels:
+        mask = labels == label
+        cluster_distances = distances[mask]
+        cluster_indices = np.where(mask)[0]
+        
+        nearest_idx = cluster_indices[np.argmin(cluster_distances)]
+        farthest_idx = cluster_indices[np.argmax(cluster_distances)]
+        
+        print(f"\n簇 {label}:")
+        print(f"最近的样本 (距离: {distances[nearest_idx]:.4f}):")
+        print(texts[nearest_idx][:200] + "...")  # 只打印前200个字符
+        print(f"最远的样本 (距离: {distances[farthest_idx]:.4f}):")
+        print(texts[farthest_idx][:200] + "...")
