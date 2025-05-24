@@ -1,6 +1,6 @@
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=5
 
 python ../src/adapter_train_edge_2.py \
     --use_deepspeed false \
