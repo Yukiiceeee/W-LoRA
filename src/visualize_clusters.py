@@ -18,6 +18,51 @@ from umap.umap_ import UMAP
 import seaborn as sns
 from Kmeans_model_embed import get_embeddings, format_text
 
+def format_data_content(item):
+    """
+    直接格式化数据集的核心内容（lecture、question、answer），不使用prompt模板
+    专门针对ScienceQA等问答数据集设计
+    """
+    content_parts = []
+    
+    if 'lecture' in item and item['lecture'] and str(item['lecture']).strip():
+        lecture_content = str(item['lecture']).strip()
+        if lecture_content.lower() not in ['none', 'null', '']:
+            content_parts.append(f"讲座内容: {lecture_content}")
+    
+    if 'question' in item and item['question'] and str(item['question']).strip():
+        question_content = str(item['question']).strip()
+        if question_content.lower() not in ['none', 'null', '']:
+            content_parts.append(f"问题: {question_content}")
+    
+    if 'answer' in item and item['answer'] and str(item['answer']).strip():
+        answer_content = str(item['answer']).strip()
+        if answer_content.lower() not in ['none', 'null', '']:
+            content_parts.append(f"答案: {answer_content}")
+    
+    if 'solution' in item and item['solution'] and str(item['solution']).strip():
+        solution_content = str(item['solution']).strip()
+        if solution_content.lower() not in ['none', 'null', '']:
+            content_parts.append(f"解答: {solution_content}")
+    
+    if not content_parts:
+        if 'instruction' in item and item['instruction'] and str(item['instruction']).strip():
+            instruction_content = str(item['instruction']).strip()
+            if instruction_content.lower() not in ['none', 'null', '']:
+                content_parts.append(f"指令: {instruction_content}")
+        
+        if 'input' in item and item['input'] and str(item['input']).strip():
+            input_content = str(item['input']).strip()
+            if input_content.lower() not in ['none', 'null', '']:
+                content_parts.append(f"输入: {input_content}")
+    
+    result = "\n".join(content_parts) if content_parts else "空内容"
+    
+    if not content_parts:
+        print(f"警告: 数据项缺少内容，可用字段: {list(item.keys())}")
+    
+    return result
+
 def preprocess_embeddings(embeddings, n_components=None):
     """
     预处理嵌入向量：标准化，可选PCA降维
@@ -201,8 +246,7 @@ def main():
         with open(args.data_path, 'r') as f:
             data = json.load(f)
 
-    prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-    texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
+    texts = [format_data_content(item) for item in data]
 
     # 获取嵌入
     print("Getting embeddings...")
@@ -254,9 +298,9 @@ def main():
             farthest_idx = cluster_indices[np.argmax(cluster_distances)]
             
             print(f"\n  Nearest sample (distance: {distances[nearest_idx]:.4f}):")
-            print(f"  {texts[nearest_idx][:200]}...")
+            print(f"  {texts[nearest_idx][:300]}...")
             print(f"\n  Farthest sample (distance: {distances[farthest_idx]:.4f}):")
-            print(f"  {texts[farthest_idx][:200]}...")
+            print(f"  {texts[farthest_idx][:300]}...")
             print("\n" + "-"*80)
 
 if __name__ == "__main__":

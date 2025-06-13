@@ -3,11 +3,14 @@ export NCCL_IB_DISABLE=1
 export CUDA_VISIBLE_DEVICES=4
 
 python ../src/DBSCAN_model_embed.py \
-    --model_path /d2/mxy/Models/Qwen2-7B \
+    --model_name /d2/mxy/Models/Qwen2-7B \
+    --embedding_path /d2/mxy/Models/Qwen2-7B/embedding.pth \
+    --eps 0.2 \
+    --min_samples 3 \
     --data_path /d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf \
-    --output_dir /d2/mxy/W-LoRA/data/ScienceQA/DBSCAN_clustered \
-    --batch_size 32 \
-    --max_length 512 \
-    --eps 0.5 \
-    --min_samples 10 \
-    --metric cosine
+    --metric cosine \
+    --pca_components 64 \
+    --task_type qa \
+    --viz_method both \
+    --output_path /d2/mxy/W-LoRA/src/cluster_output \
+    >> /d2/mxy/W-LoRA/logs/qwen2_7b_scienceqa_DBSCAN.log 2>&1
