@@ -9,7 +9,7 @@ import logging
 import json
 import argparse
 from constants import PROMPT_DICT
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
@@ -100,77 +100,66 @@ def preprocess_embeddings(embeddings, n_components=None, metric='cosine'):
     
     return embeddings_processed
 
-def cluster_embeddings_with_dbscan(embeddings, eps=None, min_samples=5, metric='cosine'):
+def cluster_embeddings_with_kmeans(embeddings, n_clusters=8, metric='cosine', max_iter=300, random_state=42):
     logger.warning(f"Input embeddings shape: {embeddings.shape}")
     
     if np.isnan(embeddings).any() or np.isinf(embeddings).any():
         logger.warning("Warning: embeddings contain NaN or inf values!")
         embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=1e20, neginf=-1e20)
     
-    # 估计eps参数
-    suggested_eps = None
-    if len(embeddings) > 100:  # 降低采样阈值
-        sample_size = min(1000, len(embeddings))  # 确保采样大小合理
-        np.random.seed(42)
-        sample_indices = np.random.choice(len(embeddings), sample_size, replace=False)
-        sample_embeddings = embeddings[sample_indices]
-        
-        from sklearn.neighbors import NearestNeighbors
-        neigh = NearestNeighbors(n_neighbors=min_samples, metric=metric)
-        neigh.fit(sample_embeddings)
-        distances, _ = neigh.kneighbors()
-        distances = np.sort(distances[:, -1])
-        
-        from kneed import KneeLocator
-        kneedle = KneeLocator(range(len(distances)), distances, 
-                             S=1.0, curve='convex', direction='increasing')
-        if kneedle.knee is not None:
-            suggested_eps = distances[kneedle.knee]
-            print(f"Suggested eps based on knee point: {suggested_eps:.3f}")
-            if eps is None:
-                eps = suggested_eps
-    if eps is None:
-        eps = 0.5
-    
     try:
-        logger.warning(f"Starting DBSCAN with eps={eps}, min_samples={min_samples}, metric={metric}")
-        dbscan = DBSCAN(
-            eps=eps,
-            min_samples=min_samples,
-            metric=metric,
-            n_jobs=-1
-        )
-        cluster_labels = dbscan.fit_predict(embeddings)
-        logger.warning(f"DBSCAN completed. Labels shape: {cluster_labels.shape}")
+        logger.warning(f"Starting K-Means with n_clusters={n_clusters}, metric={metric}, max_iter={max_iter}")
+        
+        # 根据metric选择合适的初始化方法
+        if metric == 'cosine':
+            # 对于cosine距离，使用k-means++初始化可能更好
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                init='k-means++',
+                max_iter=max_iter,
+                random_state=random_state,
+                n_init=10
+            )
+        else:  # euclidean
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                init='k-means++',
+                max_iter=max_iter,
+                random_state=random_state,
+                n_init=10
+            )
+        
+        cluster_labels = kmeans.fit_predict(embeddings)
+        cluster_centers = kmeans.cluster_centers_
+        
+        logger.warning(f"K-Means completed. Labels shape: {cluster_labels.shape}")
+        logger.warning(f"Number of clusters: {n_clusters}")
 
         logger.warning(f"calculating distances...")
         distances = np.full(len(cluster_labels), np.inf)
         representative_indices = []
-        n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-        n_noise = list(cluster_labels).count(-1)
-        logger.warning(f"Number of clusters: {n_clusters}")
-        logger.warning(f"Number of noise points: {n_noise}")
         
         unique_labels = np.unique(cluster_labels)
         
         for label in unique_labels:
-            if label != -1:
-                mask = cluster_labels == label
-                cluster_points = embeddings[mask]
-                cluster_indices = np.where(mask)[0]
-
-                if(len(cluster_indices) > 0):
-                    center = np.mean(cluster_points, axis=0)
-                    if metric == "cosine":
-                        normalized_center = center / np.linalg.norm(center)
-                        normalized_points = cluster_points / np.linalg.norm(cluster_points, axis=1, keepdims=True)
-                        cosine_similarities = np.dot(normalized_points, normalized_center)
-                        cluster_distances = 1 - cosine_similarities
-                    else:  # euclidean
-                        cluster_distances = np.linalg.norm(cluster_points - center, axis=1)
+            mask = cluster_labels == label
+            cluster_points = embeddings[mask]
+            cluster_indices = np.where(mask)[0]
+            
+            if(len(cluster_indices) > 0):
+                center = cluster_centers[label]
+                
+                if metric == "cosine":
+                    normalized_center = center / np.linalg.norm(center)
+                    normalized_points = cluster_points / np.linalg.norm(cluster_points, axis=1, keepdims=True)
+                    cosine_similarities = np.dot(normalized_points, normalized_center)
+                    cluster_distances = 1 - cosine_similarities
+                else:  # euclidean
+                    cluster_distances = np.linalg.norm(cluster_points - center, axis=1)
                         
                 distances[cluster_indices] = cluster_distances
 
+                # 选择距离质心最近的前一半样本点
                 n_representatives = max(1, int(len(cluster_indices) * 0.5))
                 closest_indices = cluster_indices[np.argsort(cluster_distances)[:n_representatives]]
                 representative_indices.extend(closest_indices.tolist())
@@ -181,26 +170,20 @@ def cluster_embeddings_with_dbscan(embeddings, eps=None, min_samples=5, metric='
                 logger.warning(f"Min distance: {np.min(cluster_distances):.4f}")
                 logger.warning(f"Max distance: {np.max(cluster_distances):.4f}")
                 logger.warning(f"Mean distance: {np.mean(cluster_distances):.4f}")
-
-        if -1 in cluster_labels:
-            max_valid_distance = np.max(distances[distances != np.inf])
-            distances[cluster_labels == -1] = max_valid_distance * 1.5
-            logger.warning(f"Noise points: {n_noise}, assigned distance: {max_valid_distance * 1.5:.4f}")
                 
-        logger.warning(f"DBSCAN finished: found {n_clusters} clusters, "
+        logger.warning(f"K-Means finished: found {n_clusters} clusters, "
                       f"selected {len(representative_indices)} representative points")
         return cluster_labels, np.array(representative_indices), distances
         
     except Exception as e:
-        logger.warning(f"DBSCAN clustering failed: {str(e)}")
+        logger.warning(f"K-Means clustering failed: {str(e)}")
         return np.array([]), np.array([]), np.array([])
 
 def selector_data_embedding(
     data_path: str,
     model_path: str,
     embedding_path: str,
-    eps: float,
-    min_samples: int,
+    n_clusters: int,
     domain: str,
     task: str,
     metric: str = 'L2'
@@ -219,7 +202,7 @@ def selector_data_embedding(
     texts = [format_text(item, prompt_input, prompt_no_input) for item in data]
 
     embeddings = get_embeddings(texts=texts, model_id=model_path, embedding_id=embedding_path)
-    labels, representative_indices, distances = cluster_embeddings_with_dbscan(embeddings, eps, min_samples, metric)
+    labels, representative_indices, distances = cluster_embeddings_with_kmeans(embeddings, n_clusters, metric)
     
     return [
         {**item, "domain": domain, "task": task}
@@ -227,7 +210,7 @@ def selector_data_embedding(
         if idx in labels
     ]
 
-def visualize_clusters(embeddings, labels, distances=None, save_path='DBSCAN_visualization.png', 
+def visualize_clusters(embeddings, labels, distances=None, save_path='cluster_visualization.png', 
                       method='tsne', title_suffix='', metric='cosine'):
     print(f"Performing {method.upper()} dimensionality reduction...")
     if method.lower() == 'tsne':
@@ -265,33 +248,27 @@ def visualize_clusters(embeddings, labels, distances=None, save_path='DBSCAN_vis
     scatter_objects = []
     
     for i, (label, color) in enumerate(zip(unique_labels, colors)):
-        if label == -1:
-            mask = labels == -1
-            scatter = plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
-                       c='gray', marker='x', alpha=0.5, s=20, label='Noise')
-        else:
-            mask = labels == label
-            scatter = plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
-                       c=[color], alpha=0.7, s=sizes[mask], 
-                       label=f'Cluster {label} (n={np.sum(mask)})')
-            scatter_objects.append(scatter)
+        mask = labels == label
+        scatter = plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1],
+                   c=[color], alpha=0.7, s=sizes[mask], 
+                   label=f'Cluster {label} (n={np.sum(mask)})')
+        scatter_objects.append(scatter)
     
     for label in unique_labels:
-        if label != -1:
-            mask = labels == label
-            if np.any(mask):
-                center_2d = np.mean(embeddings_2d[mask], axis=0)
-                plt.scatter(center_2d[0], center_2d[1], 
-                           c='red', marker='*', s=200, alpha=0.8,
-                           edgecolors='black', linewidth=1)
+        mask = labels == label
+        if np.any(mask):
+            center_2d = np.mean(embeddings_2d[mask], axis=0)
+            plt.scatter(center_2d[0], center_2d[1], 
+                       c='red', marker='*', s=200, alpha=0.8,
+                       edgecolors='black', linewidth=1)
                 
-                if distances is not None:
-                    avg_dist = np.mean(distances[mask])
-                    plt.annotate(f'C{label}\nAvg: {avg_dist:.3f}', 
-                               xy=(center_2d[0], center_2d[1]),
-                               xytext=(10, 10), textcoords='offset points',
-                               bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.3'),
-                               fontsize=8)
+            if distances is not None:
+                avg_dist = np.mean(distances[mask])
+                plt.annotate(f'C{label}\nAvg: {avg_dist:.3f}', 
+                           xy=(center_2d[0], center_2d[1]),
+                           xytext=(10, 10), textcoords='offset points',
+                           bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.3'),
+                           fontsize=8)
     
     plt.title(f'{method.upper()} Visualization ({metric.upper()} metric)\n'
               f'Point size ∝ proximity to center{title_suffix}')
@@ -304,9 +281,8 @@ def visualize_clusters(embeddings, labels, distances=None, save_path='DBSCAN_vis
     plt.close()
     print(f"Visualization saved to {save_path}")
     
-    n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
-    n_noise = np.sum(labels == -1) if -1 in unique_labels else 0
-    print(f"聚类统计: {n_clusters}个聚类, {n_noise}个噪声点")
+    n_clusters = len(unique_labels)
+    print(f"聚类统计: {n_clusters}个聚类")
     
     return embeddings_2d
 
@@ -314,8 +290,8 @@ if "__main__" == __name__:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="/d2/mxy/Models/Qwen2-7B")
     parser.add_argument("--embedding_path", type=str, default="/d2/mxy/Models/Qwen2-7B/embedding.pth")
-    parser.add_argument("--eps", type=float, default=0.3, help="DBSCAN的邻域半径参数，None表示自动估计")
-    parser.add_argument("--min_samples", type=int, default=5, help="DBSCAN的最小样本数参数")
+    parser.add_argument("--n_clusters", type=int, default=8, help="K-Means的聚类数目")
+    parser.add_argument("--max_iter", type=int, default=300, help="K-Means的最大迭代次数")
     parser.add_argument("--data_path", type=str, default="/d2/mxy/W-LoRA/data/ScienceQA/science_qa.hf")
     parser.add_argument("--metric", type=str, default="cosine", choices=['euclidean', 'cosine'], help="距离度量方式")
     parser.add_argument("--pca_components", type=int, default=128, help="PCA的组件数，更高维度可能保留更多信息")
@@ -344,59 +320,57 @@ if "__main__" == __name__:
     embeddings_processed = preprocess_embeddings(embeddings, n_components=n_components, metric=args.metric)
 
     print("Clustering embeddings...")
-    labels, representative_indices, distances = cluster_embeddings_with_dbscan(embeddings_processed, args.eps, args.min_samples, args.metric)
+    labels, representative_indices, distances = cluster_embeddings_with_kmeans(embeddings_processed, args.n_clusters, args.metric, args.max_iter)
 
     # === 验证功能 1: 距离选择验证 ===
     print(f"\n=== 距离选择验证 ===")
     unique_labels = np.unique(labels)
     for label in unique_labels:
-        if label != -1:  # 跳过噪声点
-            mask = labels == label
-            cluster_indices = np.where(mask)[0]
-            cluster_distances = distances[mask]
-            
-            n_representatives = max(1, int(len(cluster_indices) * 0.5))
-            sorted_indices = np.argsort(cluster_distances)
-            
-            selected_distances = cluster_distances[sorted_indices[:n_representatives]]
-            unselected_distances = cluster_distances[sorted_indices[n_representatives:]]
-            
-            print(f"\nCluster {label} (总共{len(cluster_indices)}个点):")
-            print(f"  选中的{n_representatives}个点距离: min={np.min(selected_distances):.4f}, max={np.max(selected_distances):.4f}, mean={np.mean(selected_distances):.4f}")
-            if len(unselected_distances) > 0:
-                print(f"  未选中的{len(unselected_distances)}个点距离: min={np.min(unselected_distances):.4f}, max={np.max(unselected_distances):.4f}, mean={np.mean(unselected_distances):.4f}")
-            print(f"  验证: 选中点最大距离 {'<=' if len(unselected_distances) == 0 or np.max(selected_distances) <= np.min(unselected_distances) else '>'} 未选中点最小距离")
+        mask = labels == label
+        cluster_indices = np.where(mask)[0]
+        cluster_distances = distances[mask]
+        
+        n_representatives = max(1, int(len(cluster_indices) * 0.5))
+        sorted_indices = np.argsort(cluster_distances)
+        
+        selected_distances = cluster_distances[sorted_indices[:n_representatives]]
+        unselected_distances = cluster_distances[sorted_indices[n_representatives:]]
+        
+        print(f"\nCluster {label} (总共{len(cluster_indices)}个点):")
+        print(f"  选中的{n_representatives}个点距离: min={np.min(selected_distances):.4f}, max={np.max(selected_distances):.4f}, mean={np.mean(selected_distances):.4f}")
+        if len(unselected_distances) > 0:
+            print(f"  未选中的{len(unselected_distances)}个点距离: min={np.min(unselected_distances):.4f}, max={np.max(unselected_distances):.4f}, mean={np.mean(unselected_distances):.4f}")
+        print(f"  验证: 选中点最大距离 {'<=' if len(unselected_distances) == 0 or np.max(selected_distances) <= np.min(unselected_distances) else '>'} 未选中点最小距离")
 
     # === 验证功能 2: 样本内容验证 ===
     print(f"\n=== 样本内容验证 ===")
     selected_samples = set(representative_indices)
     
     for label in unique_labels:
-        if label != -1:  # 跳过噪声点
-            mask = labels == label
-            cluster_indices = np.where(mask)[0]
-            
-            # 找到这个簇中被选中的前3个样本
-            cluster_selected = [idx for idx in cluster_indices if idx in selected_samples][:3]
-            
-            print(f"\nCluster {label} - 前3个代表样本:")
-            for i, idx in enumerate(cluster_selected):
-                sample_text = texts[idx][:150] + "..." if len(texts[idx]) > 150 else texts[idx]
-                print(f"  样本{i+1} (距离质心: {distances[idx]:.4f}):")
-                print(f"    {sample_text}")
-                print()
+        mask = labels == label
+        cluster_indices = np.where(mask)[0]
+        
+        # 找到这个簇中被选中的前3个样本
+        cluster_selected = [idx for idx in cluster_indices if idx in selected_samples][:3]
+        
+        print(f"\nCluster {label} - 前3个代表样本:")
+        for i, idx in enumerate(cluster_selected):
+            sample_text = texts[idx][:150] + "..." if len(texts[idx]) > 150 else texts[idx]
+            print(f"  样本{i+1} (距离质心: {distances[idx]:.4f}):")
+            print(f"    {sample_text}")
+            print()
 
     print("Visualizing clusters...")
     if args.viz_method in ['tsne', 'both']:
-        vis_path = os.path.join(args.output_path, 'cluster_visualization_tsne.png')
+        vis_path = os.path.join(args.output_path, 'KMeans_visualization_tsne.png')
         visualize_clusters(embeddings_processed, labels, distances, save_path=vis_path, 
-                         method='tsne', title_suffix=f'\neps={args.eps}, min_samples={args.min_samples}', metric=args.metric)
+                         method='tsne', title_suffix=f'\nn_clusters={args.n_clusters}, max_iter={args.max_iter}', metric=args.metric)
     if args.viz_method in ['umap', 'both']:
-        vis_path = os.path.join(args.output_path, 'cluster_visualization_umap.png')
+        vis_path = os.path.join(args.output_path, 'KMeans_visualization_umap.png')
         visualize_clusters(embeddings_processed, labels, distances, save_path=vis_path, 
-                         method='umap', title_suffix=f'\neps={args.eps}, min_samples={args.min_samples}', metric=args.metric)
+                         method='umap', title_suffix=f'\nn_clusters={args.n_clusters}, max_iter={args.max_iter}', metric=args.metric)
     
-    # 修复bug: 使用representative_indices来标记选中的样本
+    # 使用representative_indices来标记选中的样本
     selected_samples = set(representative_indices)
     label_list = [1 if i in selected_samples else 0 for i in range(len(embeddings))]
     
@@ -408,4 +382,4 @@ if "__main__" == __name__:
     for i, idx in enumerate(representative_indices[:5]):
         print(f"\nSample {idx} (Cluster {labels[idx]}):")
         print(f"Distance to center: {distances[idx]:.4f}")
-        print(texts[idx][:200] + "..." if len(texts[idx]) > 200 else texts[idx])
+        print(texts[idx][:200] + "..." if len(texts[idx]) > 200 else texts[idx]) 
